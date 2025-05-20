@@ -1,12 +1,11 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,66 +13,91 @@ import (
 	"github.com/metoro-io/mcp-golang/transport/stdio"
 )
 
-type Input struct {
-	Query string `json:"query" jsonschema:"required,description=Query to send to children"`
+// Input types for different tools
+type BasicInput struct {
+	Query string `json:"query" jsonschema:"required,description=Query string"`
+}
+
+type StringInput struct {
+	Text string `json:"text" jsonschema:"required,description=Text to process"`
+}
+
+type CalcInput struct {
+	Numbers []float64 `json:"numbers" jsonschema:"required,description=List of numbers"`
 }
 
 func main() {
 	// Initialize the MCP server
 	server := mcp.NewServer(stdio.NewStdioServerTransport())
 
-	// Register the custom tool
-	err := server.RegisterTool("relay", "Relay query to hello MCP", relayToolHandler)
-	if err != nil {
-		log.Fatalf("Failed to register tool: %v", err)
+	// Register tools
+	tools := []struct {
+		name        string
+		description string
+		handler     interface{}
+	}{
+		{"echo", "Echo the input text", echoHandler},
+		{"reverse", "Reverse the input text", reverseHandler},
+		{"calculate", "Perform calculations", calculateHandler},
+		{"timestamp", "Get current timestamp", timestampHandler},
 	}
 
-	// Gracefully handle shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	for _, tool := range tools {
+		if err := server.RegisterTool(tool.name, tool.description, tool.handler); err != nil {
+			log.Fatalf("Failed to register %s tool: %v", tool.name, err)
+		}
+		log.Printf("Registered tool: %s", tool.name)
+	}
+
+	// Handle graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	// Start the MCP server
-	log.Println("Starting the server...")
 	go func() {
+		log.Println("Starting MCP server...")
 		if err := server.Serve(); err != nil {
-			log.Printf("Server encountered an error: %v", err)
-			close(quit) // Exit if Serve fails unexpectedly
+			log.Printf("Server error: %v", err)
+			stop <- syscall.SIGTERM
 		}
 	}()
 
-	// Block until a termination signal is received
-	<-quit
-	log.Println("Server shutting down gracefully.")
+	<-stop
+	log.Println("Server shutting down gracefully...")
 }
 
-// relayToolHandler handles the communication with the child "hello" MCP process.
-func relayToolHandler(args Input) (*mcp.ToolResponse, error) {
-	_, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+func echoHandler(args StringInput) (*mcp.ToolResponse, error) {
+	result := strings.TrimSpace(args.Text)
+	return mcp.NewToolResponse(mcp.NewTextContent(result)), nil
+}
 
-	// Example subprocess execution (run the "hello-mcp" child server)
-	cmd := "./hello-mcp"
-	helloCmd := exec.Command(cmd)
-	helloCmd.Stdin = os.Stdin
-	helloCmd.Stdout = os.Stdout
-	helloCmd.Stderr = os.Stderr
+func reverseHandler(args StringInput) (*mcp.ToolResponse, error) {
+	runes := []rune(args.Text)
+	for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+		runes[i], runes[j] = runes[j], runes[i]
+	}
+	return mcp.NewToolResponse(mcp.NewTextContent(string(runes))), nil
+}
 
-	log.Printf("Starting subprocess: %s", cmd)
-	err := helloCmd.Start()
-	if err != nil {
-		return nil, fmt.Errorf("subprocess start failed: %w", err)
+func calculateHandler(args CalcInput) (*mcp.ToolResponse, error) {
+	if len(args.Numbers) == 0 {
+		return nil, fmt.Errorf("no numbers provided")
 	}
 
-	defer func() {
-		log.Println("Cleaning up subprocess...")
-		_ = helloCmd.Process.Kill()
-		_ = helloCmd.Wait()
-	}()
+	sum := 0.0
+	for _, n := range args.Numbers {
+		sum += n
+	}
+	avg := sum / float64(len(args.Numbers))
 
-	// Simulated calls to the subprocess (replace with real logic)
-	log.Printf("Simulating request relayed to hello subprocess...")
-	time.Sleep(2 * time.Second)
+	result := fmt.Sprintf("Sum: %.2f\nAverage: %.2f", sum, avg)
+	return mcp.NewToolResponse(mcp.NewTextContent(result)), nil
+}
 
-	// Return a dummy success response
-	return mcp.NewToolResponse(mcp.NewTextContent("Hello MCP relay successful!")), nil
+func timestampHandler(args BasicInput) (*mcp.ToolResponse, error) {
+	now := time.Now()
+	result := fmt.Sprintf("Current time: %s\nUnix: %d",
+		now.Format(time.RFC3339),
+		now.Unix())
+	return mcp.NewToolResponse(mcp.NewTextContent(result)), nil
 }
