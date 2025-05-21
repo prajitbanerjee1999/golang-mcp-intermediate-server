@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,15 +19,7 @@ import (
 
 // Config represents the configuration for the MCP clients and servers
 type Config struct {
-	Port            string                    `json:"Port"`
-	MCPSSEServers   []MCPSSEServerConfig      `json:"MCPSSEServers"`
 	MCPStdIOServers map[string]MCPStdIOConfig `json:"MCPStdIOServers"`
-}
-
-// MCPSSEServerConfig represents the configuration for an MCP SSE server
-type MCPSSEServerConfig struct {
-	URL            string `json:"URL"`
-	MaxPayloadSize int    `json:"MaxPayloadSize"`
 }
 
 // MCPStdIOConfig represents the configuration for an MCP StdIO server
@@ -40,8 +31,10 @@ type MCPStdIOConfig struct {
 }
 
 func main() {
+	// Initialize the MCP server with stdio transport
+	server := mcp.NewServer(stdio.NewStdioServerTransport())
+
 	// Load configuration
-	var Port = "7562"
 	cfg := loadConfig("mcp.json")
 
 	// Create the MCP client information
@@ -50,17 +43,115 @@ func main() {
 		Version: "1.0.0",
 	}
 
-	// Initialize MCP clients based on mcp.json
+	// Initialize MCP clients
 	mcpClients, stdIOCmds := initializeMCPClients(cfg, mcpClientInfo)
-
-	// Ensure all clients are initialized and fetch their tools
-	initializeAndListTools(mcpClients)
-
-	// Set up graceful shutdown and cleanup
 	defer shutdownMCPClients(mcpClients, stdIOCmds)
 
-	// Start a lightweight HTTP server (for demonstration purposes)
-	startHTTPServer(Port, mcpClients)
+	// Initialize all clients and fetch their tools
+	initializeAndListTools(mcpClients)
+
+	// Register tools with the server
+	registerTools(server, mcpClients)
+
+	// Handle graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Start the server
+	go func() {
+		log.Println("Starting MCP server...")
+		if err := server.Serve(); err != nil {
+			log.Printf("Server error: %v", err)
+			stop <- syscall.SIGTERM
+		}
+	}()
+
+	<-stop
+	log.Println("Server shutting down gracefully...")
+}
+
+// registerTools registers all the tools with the MCP server
+func registerTools(server *mcp.Server, mcpClients []*mcp.Client) {
+	tools := []struct {
+		name        string
+		description string
+		handler     interface{}
+	}{
+		{"tools/list", "List all available tools", handleListTools(mcpClients)},
+		{"tools/call", "Call a specific tool", handleCallTool(mcpClients)},
+	}
+
+	for _, tool := range tools {
+		if err := server.RegisterTool(tool.name, tool.description, tool.handler); err != nil {
+			log.Fatalf("Failed to register %s tool: %v", tool.name, err)
+		}
+		log.Printf("Registered tool: %s", tool.name)
+	}
+}
+
+// Tool handlers
+type ListToolsRequest struct {
+	Cursor string `json:"cursor"`
+}
+
+type CallToolRequest struct {
+	Name      string      `json:"name"`
+	Arguments interface{} `json:"arguments"`
+}
+
+func handleListTools(mcpClients []*mcp.Client) interface{} {
+	return func(args ListToolsRequest) (*mcp.ToolResponse, error) {
+		var allTools []interface{}
+		for _, client := range mcpClients {
+			tools, err := client.ListTools(context.Background(), &args.Cursor)
+			if err != nil {
+				continue
+			}
+			for _, tool := range tools.Tools {
+				allTools = append(allTools, tool)
+			}
+		}
+
+		// Convert tools to JSON string
+		toolsJSON, err := json.Marshal(map[string]interface{}{
+			"tools": allTools,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal tools: %v", err)
+		}
+
+		return &mcp.ToolResponse{
+			Content: []*mcp.Content{
+				{
+					Type: "text",
+					TextContent: &mcp.TextContent{
+						Text: string(toolsJSON),
+					},
+				},
+			},
+		}, nil
+	}
+}
+
+func handleCallTool(mcpClients []*mcp.Client) interface{} {
+	return func(args CallToolRequest) (*mcp.ToolResponse, error) {
+		for _, client := range mcpClients {
+			resp, err := client.CallTool(context.Background(), args.Name, args.Arguments)
+			if err == nil {
+				return resp, nil
+			}
+		}
+		return &mcp.ToolResponse{
+			Content: []*mcp.Content{
+				{
+					Type: "text",
+					TextContent: &mcp.TextContent{
+						Text: "method not found",
+					},
+				},
+			},
+		}, nil
+	}
 }
 
 // loadConfig reads and parses the configuration from the given file path
@@ -212,106 +303,5 @@ func shutdownMCPClients(mcpClients []*mcp.Client, stdIOCmds []*exec.Cmd) {
 		if err != nil {
 			return
 		}
-	}
-}
-
-// startHTTPServer starts the HTTP server
-func startHTTPServer(port string, mcpClients []*mcp.Client) {
-	// Create a router to handle different endpoints
-	mux := http.NewServeMux()
-
-	// Base endpoint
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("MCP Server running"))
-	})
-
-	// List all tools endpoint
-	mux.HandleFunc("/tools", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var allTools []map[string]interface{}
-		for i, client := range mcpClients {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			cursor := ""
-			tools, err := client.ListTools(ctx, &cursor)
-			cancel()
-
-			if err != nil {
-				log.Printf("Error fetching tools from client %d: %v", i+1, err)
-				continue
-			}
-
-			allTools = append(allTools, map[string]interface{}{
-				"clientIndex": i + 1,
-				"tools":       tools.Tools,
-			})
-		}
-
-		json.NewEncoder(w).Encode(allTools)
-	})
-
-	// Call specific tool endpoint
-	mux.HandleFunc("/call-tool", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var request struct {
-			ClientIndex int         `json:"clientIndex"`
-			ToolName    string      `json:"toolName"`
-			Arguments   interface{} `json:"arguments"`
-		}
-
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
-
-		if request.ClientIndex <= 0 || request.ClientIndex > len(mcpClients) {
-			http.Error(w, "Invalid client index", http.StatusBadRequest)
-			return
-		}
-
-		client := mcpClients[request.ClientIndex-1]
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		response, err := client.CallTool(ctx, request.ToolName, request.Arguments)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Tool call failed: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		json.NewEncoder(w).Encode(response)
-	})
-
-	// Create the HTTP server
-	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
-	}
-
-	// Handle graceful shutdown
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		log.Printf("HTTP server starting on port %s...", port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
-		}
-	}()
-
-	<-stop
-	log.Println("Shutting down HTTP server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
 	}
 }

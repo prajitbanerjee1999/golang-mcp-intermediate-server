@@ -1,0 +1,38 @@
+{
+  "MCPStdIOServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "Env": {},
+      "WorkingDir": "."
+    },
+    "filesystem": {
+      "Command": "npx",
+      "Args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "~"
+      ],
+      "Env": {},
+      "WorkingDir": "."
+    },
+    "web-research": {
+      "Command": "npx",
+      "Args": [
+        "-y",
+        "@mzxrai/mcp-webresearch"
+      ],
+      "Env": {},
+      "WorkingDir": "."
+    },
+    "mcp-installer": {
+      "Command": "npx",
+      "Args": [
+        "-y",
+        "@anaisbetts/mcp-installer"
+      ],
+      "Env": {},
+      "WorkingDir": "."
+    }
+  }
+}
